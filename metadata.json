@@ -1,0 +1,6 @@
+{
+  "name": "BookForge AI",
+  "description": "Turn scattered knowledge into a professionally structured ebook.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
