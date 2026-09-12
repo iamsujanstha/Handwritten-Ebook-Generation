@@ -172,7 +172,7 @@ export default function SourceLibrary() {
                 >
                   <UploadCloud className="w-12 h-12 text-slate-400 mx-auto mb-3" />
                   <p className="text-sm font-bold text-slate-900 mb-1 uppercase tracking-widest">Click to upload or drag and drop</p>
-                  <p className="text-xs text-slate-500 mb-4 font-bold uppercase tracking-widest">PDF files up to 50MB</p>
+                  <p className="text-xs text-slate-500 mb-4 font-bold uppercase tracking-widest">PDF, DOCX, MD, TXT up to 50MB</p>
                   <button className="px-4 py-2 bg-white border border-slate-300 rounded text-sm font-bold uppercase tracking-widest text-slate-700 hover:bg-slate-50">
                     Select Files
                   </button>
@@ -180,7 +180,7 @@ export default function SourceLibrary() {
                     type="file" 
                     ref={fileInputRef} 
                     className="hidden" 
-                    accept=".pdf" 
+                    accept="application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/markdown,text/plain,.pdf,.doc,.docx,.md,.txt" 
                     multiple 
                     onChange={handleFileUpload} 
                   />

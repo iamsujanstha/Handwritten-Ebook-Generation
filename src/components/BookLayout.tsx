@@ -33,10 +33,10 @@ export default function BookLayout() {
             Back to Dashboard
           </button>
           <div className="flex items-center gap-2">
-            <div className="h-6 w-6 rounded bg-orange-600 flex items-center justify-center text-white font-bold text-xs">B</div>
+            <div className="h-6 w-6 rounded bg-orange-600 flex items-center justify-center text-white font-bold text-xs">H</div>
             <h2 className="text-lg font-bold tracking-tight text-slate-800 uppercase truncate" title={book.title}>{book.title}</h2>
           </div>
-          <p className="text-xs text-slate-500 truncate mt-1 uppercase tracking-widest font-bold">BookForge Workspace</p>
+          <p className="text-xs text-slate-500 truncate mt-1 uppercase tracking-widest font-bold">Handwritten eBook</p>
         </div>
         
         <nav className="flex-1 overflow-y-auto p-4 space-y-2">

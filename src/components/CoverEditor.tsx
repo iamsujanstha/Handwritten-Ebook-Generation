@@ -1,7 +1,6 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import { 
   Image as ImageIcon, 
-  Upload, 
   Trash2, 
   Check, 
   Palette, 
@@ -14,11 +13,10 @@ import {
   Compass,
   Cpu,
   Bookmark,
-  Atom,
-  Link2
+  Atom
 } from "lucide-react";
 import { useNotebookStore } from "../store/useNotebookStore";
-import { generateCoverPageHtml } from "../lib/coverGenerator";
+import { generateCoverPageHtml, sanitizeCoverImageUrl } from "../lib/coverGenerator";
 import { CoverPageConfig } from "../types";
 import { AutoSaveIndicator } from "./AutoSaveIndicator";
 
@@ -64,6 +62,9 @@ const TEMPLATES: { id: CoverPageConfig["template"]; label: string; desc: string;
   },
 ];
 
+const createEmblemDataUri = (svgStr: string) => 
+  `data:image/svg+xml;utf8,${encodeURIComponent(svgStr.trim())}`;
+
 // Curated Zero-AI Vector Emblems (rendered with 0 Gemini quota)
 const PRESET_EMBLEMS = [
   {
@@ -71,39 +72,45 @@ const PRESET_EMBLEMS = [
     name: "Engineering Compass",
     desc: "Architectural & Technical Drafting",
     icon: Compass,
-    svg: `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><circle cx="200" cy="200" r="180" fill="none" stroke="%231c4b82" stroke-width="4" stroke-dasharray="8 6"/><circle cx="200" cy="200" r="150" fill="none" stroke="%231c4b82" stroke-width="2"/><circle cx="200" cy="200" r="12" fill="%231c4b82"/><line x1="200" y1="20" x2="200" y2="380" stroke="%231c4b82" stroke-width="1.5" stroke-dasharray="4 4"/><line x1="20" y1="200" x2="380" y2="200" stroke="%231c4b82" stroke-width="1.5" stroke-dasharray="4 4"/><path d="M200 60 L140 330 M200 60 L260 330 M150 250 L250 250" fill="none" stroke="%231c4b82" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="200" cy="60" r="16" fill="%231c4b82"/></svg>`
+    svg: createEmblemDataUri(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><circle cx="200" cy="200" r="180" fill="none" stroke="#1c4b82" stroke-width="4" stroke-dasharray="8 6"/><circle cx="200" cy="200" r="150" fill="none" stroke="#1c4b82" stroke-width="2"/><circle cx="200" cy="200" r="12" fill="#1c4b82"/><line x1="200" y1="20" x2="200" y2="380" stroke="#1c4b82" stroke-width="1.5" stroke-dasharray="4 4"/><line x1="20" y1="200" x2="380" y2="200" stroke="#1c4b82" stroke-width="1.5" stroke-dasharray="4 4"/><path d="M200 60 L140 330 M200 60 L260 330 M150 250 L250 250" fill="none" stroke="#1c4b82" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="200" cy="60" r="16" fill="#1c4b82"/></svg>`)
   },
   {
     id: "system",
     name: "Systems & Circuits",
     desc: "Network Nodes & Architecture",
     icon: Cpu,
-    svg: `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><rect x="40" y="40" width="320" height="320" rx="16" fill="none" stroke="%231c4b82" stroke-width="4"/><rect x="120" y="120" width="160" height="160" rx="8" fill="none" stroke="%231c4b82" stroke-width="5"/><circle cx="200" cy="200" r="36" fill="%231c4b82" fill-opacity="0.1" stroke="%231c4b82" stroke-width="4"/><path d="M120 160 H60 M120 200 H60 M120 240 H60 M280 160 H340 M280 200 H340 M280 240 H340 M160 120 V60 M200 120 V60 M240 120 V60 M160 280 V340 M200 280 V340 M240 280 V340" stroke="%231c4b82" stroke-width="4" stroke-linecap="round"/><circle cx="60" cy="160" r="6" fill="%231c4b82"/><circle cx="60" cy="200" r="6" fill="%231c4b82"/><circle cx="60" cy="240" r="6" fill="%231c4b82"/><circle cx="340" cy="160" r="6" fill="%231c4b82"/><circle cx="340" cy="200" r="6" fill="%231c4b82"/><circle cx="340" cy="240" r="6" fill="%231c4b82"/></svg>`
+    svg: createEmblemDataUri(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><rect x="40" y="40" width="320" height="320" rx="16" fill="none" stroke="#1c4b82" stroke-width="4"/><rect x="120" y="120" width="160" height="160" rx="8" fill="none" stroke="#1c4b82" stroke-width="5"/><circle cx="200" cy="200" r="36" fill="#1c4b82" fill-opacity="0.1" stroke="#1c4b82" stroke-width="4"/><path d="M120 160 H60 M120 200 H60 M120 240 H60 M280 160 H340 M280 200 H340 M280 240 H340 M160 120 V60 M200 120 V60 M240 120 V60 M160 280 V340 M200 280 V340 M240 280 V340" stroke="#1c4b82" stroke-width="4" stroke-linecap="round"/><circle cx="60" cy="160" r="6" fill="#1c4b82"/><circle cx="60" cy="200" r="6" fill="#1c4b82"/><circle cx="60" cy="240" r="6" fill="#1c4b82"/><circle cx="340" cy="160" r="6" fill="#1c4b82"/><circle cx="340" cy="200" r="6" fill="#1c4b82"/><circle cx="340" cy="240" r="6" fill="#1c4b82"/></svg>`)
   },
   {
     id: "knowledge",
     name: "Open Manual",
     desc: "Documentation & Reference",
     icon: Bookmark,
-    svg: `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><circle cx="200" cy="200" r="170" fill="none" stroke="%231c4b82" stroke-width="3"/><path d="M200 130 C160 100 100 100 70 120 V300 C100 280 160 280 200 310 C240 280 300 280 330 300 V120 C300 100 240 100 200 130 Z" fill="none" stroke="%231c4b82" stroke-width="6" stroke-linejoin="round"/><line x1="200" y1="130" x2="200" y2="310" stroke="%231c4b82" stroke-width="5"/><line x1="100" y1="160" x2="175" y2="160" stroke="%231c4b82" stroke-width="3" stroke-linecap="round"/><line x1="100" y1="200" x2="175" y2="200" stroke="%231c4b82" stroke-width="3" stroke-linecap="round"/><line x1="100" y1="240" x2="160" y2="240" stroke="%231c4b82" stroke-width="3" stroke-linecap="round"/><line x1="225" y1="160" x2="300" y2="160" stroke="%231c4b82" stroke-width="3" stroke-linecap="round"/><line x1="225" y1="200" x2="300" y2="200" stroke="%231c4b82" stroke-width="3" stroke-linecap="round"/><line x1="225" y1="240" x2="285" y2="240" stroke="%231c4b82" stroke-width="3" stroke-linecap="round"/></svg>`
+    svg: createEmblemDataUri(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><circle cx="200" cy="200" r="170" fill="none" stroke="#1c4b82" stroke-width="3"/><path d="M200 130 C160 100 100 100 70 120 V300 C100 280 160 280 200 310 C240 280 300 280 330 300 V120 C300 100 240 100 200 130 Z" fill="none" stroke="#1c4b82" stroke-width="6" stroke-linejoin="round"/><line x1="200" y1="130" x2="200" y2="310" stroke="#1c4b82" stroke-width="5"/><line x1="100" y1="160" x2="175" y2="160" stroke="#1c4b82" stroke-width="3" stroke-linecap="round"/><line x1="100" y1="200" x2="175" y2="200" stroke="#1c4b82" stroke-width="3" stroke-linecap="round"/><line x1="100" y1="240" x2="160" y2="240" stroke="#1c4b82" stroke-width="3" stroke-linecap="round"/><line x1="225" y1="160" x2="300" y2="160" stroke="#1c4b82" stroke-width="3" stroke-linecap="round"/><line x1="225" y1="200" x2="300" y2="200" stroke="#1c4b82" stroke-width="3" stroke-linecap="round"/><line x1="225" y1="240" x2="285" y2="240" stroke="#1c4b82" stroke-width="3" stroke-linecap="round"/></svg>`)
   },
   {
     id: "science",
     name: "Atomic Research",
     desc: "Physics, Science & Calculations",
     icon: Atom,
-    svg: `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><circle cx="200" cy="200" r="28" fill="%231c4b82"/><ellipse cx="200" cy="200" rx="160" ry="60" fill="none" stroke="%231c4b82" stroke-width="4" transform="rotate(0 200 200)"/><ellipse cx="200" cy="200" rx="160" ry="60" fill="none" stroke="%231c4b82" stroke-width="4" transform="rotate(60 200 200)"/><ellipse cx="200" cy="200" rx="160" ry="60" fill="none" stroke="%231c4b82" stroke-width="4" transform="rotate(120 200 200)"/><circle cx="60" cy="200" r="10" fill="%231c4b82"/><circle cx="280" cy="338" r="10" fill="%231c4b82"/><circle cx="280" cy="62" r="10" fill="%231c4b82"/></svg>`
+    svg: createEmblemDataUri(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400"><circle cx="200" cy="200" r="28" fill="#1c4b82"/><ellipse cx="200" cy="200" rx="160" ry="60" fill="none" stroke="#1c4b82" stroke-width="4" transform="rotate(0 200 200)"/><ellipse cx="200" cy="200" rx="160" ry="60" fill="none" stroke="#1c4b82" stroke-width="4" transform="rotate(60 200 200)"/><ellipse cx="200" cy="200" rx="160" ry="60" fill="none" stroke="#1c4b82" stroke-width="4" transform="rotate(120 200 200)"/><circle cx="60" cy="200" r="10" fill="#1c4b82"/><circle cx="280" cy="338" r="10" fill="#1c4b82"/><circle cx="280" cy="62" r="10" fill="#1c4b82"/></svg>`)
   }
 ];
 
 export const CoverEditor: React.FC = () => {
   const { coverConfig, updateCoverConfig, title } = useNotebookStore();
 
-  const [imageUrlInput, setImageUrlInput] = useState("");
-  const [isUploading, setIsUploading] = useState(false);
   const [scale, setScale] = useState<number>(0.75);
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Normalize legacy unencoded SVG in state if present
+  useEffect(() => {
+    if (coverConfig.imageUrl) {
+      const sanitized = sanitizeCoverImageUrl(coverConfig.imageUrl);
+      if (sanitized && sanitized !== coverConfig.imageUrl) {
+        updateCoverConfig({ imageUrl: sanitized });
+      }
+    }
+  }, [coverConfig.imageUrl, updateCoverConfig]);
 
   // Sync title from store if cover title is empty
   useEffect(() => {
@@ -142,44 +149,6 @@ export const CoverEditor: React.FC = () => {
       </body>
     </html>
   `;
-
-  // Handle manual file upload
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setIsUploading(true);
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const res = await fetch("/api/upload-image", {
-        method: "POST",
-        body: formData
-      });
-
-      if (!res.ok) {
-        throw new Error("Failed to upload image");
-      }
-
-      const data = await res.json();
-      if (data.url) {
-        updateCoverConfig({ imageUrl: data.url });
-      }
-    } catch (err: any) {
-      console.error(err);
-      alert("Failed to upload image: " + err.message);
-    } finally {
-      setIsUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
-  };
-
-  const handleApplyImageUrl = () => {
-    if (!imageUrlInput.trim()) return;
-    updateCoverConfig({ imageUrl: imageUrlInput.trim() });
-    setImageUrlInput("");
-  };
 
   // Open Preview in new tab
   const handleOpenPreviewTab = () => {
@@ -271,23 +240,47 @@ export const CoverEditor: React.FC = () => {
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Author / Team</label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-700">Author / Team</label>
+                  {coverConfig.author && (
+                    <button
+                      type="button"
+                      onClick={() => updateCoverConfig({ author: "" })}
+                      className="text-[10px] text-slate-400 hover:text-red-500 font-medium transition-colors"
+                      title="Clear author"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
                 <input
                   type="text"
                   value={coverConfig.author}
                   onChange={(e) => updateCoverConfig({ author: e.target.value })}
-                  placeholder="Principal Systems Architect"
+                  placeholder="Optional (leave blank to omit)"
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-slate-800"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Edition / Date</label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-700">Edition / Date</label>
+                  {coverConfig.edition && (
+                    <button
+                      type="button"
+                      onClick={() => updateCoverConfig({ edition: "" })}
+                      className="text-[10px] text-slate-400 hover:text-red-500 font-medium transition-colors"
+                      title="Clear edition"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
                 <input
                   type="text"
                   value={coverConfig.edition}
                   onChange={(e) => updateCoverConfig({ edition: e.target.value })}
-                  placeholder="First Edition • 2026"
+                  placeholder="Optional (leave blank to omit)"
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-slate-800"
                 />
               </div>
@@ -385,19 +378,12 @@ export const CoverEditor: React.FC = () => {
             {coverConfig.imageUrl ? (
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center space-x-3">
                 <div className="w-16 h-20 bg-white rounded overflow-hidden shrink-0 border border-slate-300 flex items-center justify-center p-1.5">
-                  <img src={coverConfig.imageUrl} alt="Cover Preview" className="max-w-full max-h-full object-contain" />
+                  <img src={sanitizeCoverImageUrl(coverConfig.imageUrl)} alt="Cover Preview" className="max-w-full max-h-full object-contain" />
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="text-xs font-semibold text-slate-800 truncate">Artwork Attached</div>
                   <p className="text-[11px] text-slate-500 mt-0.5">Rendered on Page 1 of the exported ebook.</p>
                   <div className="mt-2 flex space-x-2">
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="text-[11px] px-2 py-1 bg-white border border-slate-300 hover:bg-slate-100 rounded text-slate-700 font-medium"
-                    >
-                      Replace File
-                    </button>
                     <button
                       type="button"
                       onClick={() => updateCoverConfig({ imageUrl: "" })}
@@ -421,7 +407,8 @@ export const CoverEditor: React.FC = () => {
               <div className="grid grid-cols-2 gap-2">
                 {PRESET_EMBLEMS.map((emblem) => {
                   const IconComp = emblem.icon;
-                  const isSelected = coverConfig.imageUrl === emblem.svg;
+                  const sanitizedCurrent = sanitizeCoverImageUrl(coverConfig.imageUrl);
+                  const isSelected = sanitizedCurrent === emblem.svg || coverConfig.imageUrl === emblem.svg;
                   return (
                     <button
                       key={emblem.id}
@@ -443,50 +430,6 @@ export const CoverEditor: React.FC = () => {
                     </button>
                   );
                 })}
-              </div>
-            </div>
-
-            {/* Upload Custom File or Paste URL */}
-            <div className="space-y-2 pt-1">
-              <label className="block text-xs font-semibold text-slate-700">Upload Custom Image or Paste URL</label>
-              <div className="flex space-x-2">
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={isUploading}
-                  className="flex-1 flex items-center justify-center px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
-                >
-                  <Upload className="w-3.5 h-3.5 mr-1.5" />
-                  {isUploading ? "Uploading..." : "Upload Image File"}
-                </button>
-                <input 
-                  type="file" 
-                  ref={fileInputRef} 
-                  onChange={handleFileUpload} 
-                  accept="image/*" 
-                  className="hidden" 
-                />
-              </div>
-
-              <div className="flex space-x-1.5 pt-1">
-                <div className="relative flex-1">
-                  <Link2 className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
-                  <input
-                    type="url"
-                    value={imageUrlInput}
-                    onChange={(e) => setImageUrlInput(e.target.value)}
-                    placeholder="Or paste image URL (https://...)"
-                    className="w-full pl-8 pr-2.5 py-1.5 text-xs border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 bg-white"
-                  />
-                </div>
-                <button
-                  type="button"
-                  onClick={handleApplyImageUrl}
-                  disabled={!imageUrlInput.trim()}
-                  className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-md text-xs font-semibold disabled:opacity-40"
-                >
-                  Apply
-                </button>
               </div>
             </div>
           </div>

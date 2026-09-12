@@ -7,9 +7,21 @@ import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import { v4 as uuidv4 } from "uuid";
 import puppeteer from "puppeteer-core";
-import chromium from "@sparticuz/chromium";
+import _chromium from "@sparticuz/chromium";
+const chromium = (_chromium as any).default || _chromium;
 import fs from "fs/promises";
 import fsSync from "fs";
+
+// Ensure shared libraries in vendor/lib/linux-x64 are available for Chromium on Linux/Cloud Run
+const vendorLibPath = path.join(process.cwd(), "vendor", "lib", "linux-x64");
+if (fsSync.existsSync(vendorLibPath)) {
+  process.env.LD_LIBRARY_PATH = `${vendorLibPath}:${process.env.LD_LIBRARY_PATH || ""}`;
+  console.log("Configured LD_LIBRARY_PATH with bundled Linux shared libraries:", vendorLibPath);
+}
+
+import { exec } from "child_process";
+import util from "util";
+const execAsync = util.promisify(exec);
 import os from "os";
 import crypto from "crypto";
 import { PDFDocument } from "pdf-lib";
@@ -20,6 +32,32 @@ const PORT = 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
+
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+app.use((req, res, next) => {
+  const modelHeader = req.headers['x-gemini-model'];
+  if (modelHeader && typeof modelHeader === 'string') {
+    if (
+      modelHeader.includes('1.5') || 
+      modelHeader.includes('3.5-pro') || 
+      modelHeader.includes('2.0-flash') ||
+      modelHeader.includes('hermes') ||
+      modelHeader.includes('nousresearch') ||
+      modelHeader.includes('openrouter')
+    ) {
+      req.headers['x-gemini-model'] = 'gemini-2.5-flash';
+    }
+  }
+  next();
+});
+
+
+
+
+
 
 // Static directory for uploaded images
 const uploadsDir = path.join(process.cwd(), "uploads");
@@ -100,24 +138,100 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MAX_RETRIES = 10;
 const BASE_DELAY = 2000;
 
-async function generateContentWithRetry(params: any, customApiKey?: string, retries = MAX_RETRIES): Promise<any> {
+async function generateContentWithRetry(params: any, customApiKey?: string, apiBaseUrl?: string, retries = 3): Promise<any> {
+  if (apiBaseUrl) {
+    const messages = [];
+    let promptContent = "";
+    if (typeof params.contents === "string") promptContent = params.contents;
+    else if (Array.isArray(params.contents)) promptContent = params.contents.map(c => c.text ? c.text : JSON.stringify(c)).join("\n");
+    else promptContent = JSON.stringify(params.contents);
+
+    messages.push({ role: "user", content: promptContent });
+
+    let responseFormat;
+    if (params.config?.responseMimeType === "application/json") {
+      responseFormat = { type: "json_object" };
+      messages[0].content += "\n\nYou MUST respond with valid JSON only. Do not wrap with ```json markdown.";
+    }
+
+    for (let i = 0; i < retries; i++) {
+      try {
+        const fetchParams = {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${customApiKey || ""}`,
+            "HTTP-Referer": "https://aistudio.google.com",
+            "X-Title": "AI Studio Applet"
+          },
+          body: JSON.stringify({
+            model: params.model,
+            messages: messages,
+            response_format: responseFormat
+          })
+        };
+        const res = await fetch(`${apiBaseUrl.replace(/\/$/, "")}/chat/completions`, fetchParams);
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Custom API error: ${res.status} ${text}`);
+        }
+        const data = await res.json();
+        return {
+          text: data.choices?.[0]?.message?.content || "",
+          usageMetadata: {
+            promptTokenCount: data.usage?.prompt_tokens || 0,
+            candidatesTokenCount: data.usage?.completion_tokens || 0,
+            totalTokenCount: data.usage?.total_tokens || 0
+          }
+        };
+      } catch (error: any) {
+        console.warn(`Custom API failed (${error.message}). Gracefully falling back to Google Gemini.`);
+        break; // Fall through to official server-side Google Gemini
+      }
+    }
+  }
   const client = customApiKey ? new GoogleGenAI({ apiKey: customApiKey }) : ai;
+  const fallbacks = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro-latest"];
+  let fallbackIndex = 0;
+  
   for (let i = 0; i < retries; i++) {
     try {
       return await client.models.generateContent(params);
     } catch (error: any) {
-      const isRetryable = error?.status === 429 || error?.status === 503 || error?.message?.includes("503") || error?.message?.includes("429") || error?.message?.includes("high demand") || error?.message?.includes("Spikes in demand") || error?.message?.includes("UNAVAILABLE") || error?.message?.includes("RESOURCE_EXHAUSTED") || error?.message?.includes("Quota exceeded");
+      const isRetryable = error?.status === 404 || error?.message?.includes("NOT_FOUND") || error?.message?.includes("no longer available") || error?.status === 429 || error?.status === 503 || error?.message?.includes("503") || error?.message?.includes("429") || error?.message?.includes("high demand") || error?.message?.includes("Spikes in demand") || error?.message?.includes("UNAVAILABLE") || error?.message?.includes("RESOURCE_EXHAUSTED") || error?.message?.includes("Quota exceeded");
       
       if (isRetryable && i < retries - 1) {
         let delayMs = BASE_DELAY * Math.pow(2, i) + Math.random() * 1000;
         
         // Handle aggressive rate limits (429) specifically for the 5 RPM free tier
-        if (error?.status === 429 || error?.message?.includes("429") || error?.message?.includes("Quota exceeded") || error?.message?.includes("RESOURCE_EXHAUSTED")) {
-          const retryMatch = error?.message?.match(/retry in (\d+(?:\.\d+)?)s/);
-          if (retryMatch && retryMatch[1]) {
-            delayMs = parseFloat(retryMatch[1]) * 1000 + 3000; // Exact wait time + 3s buffer
+        if (error?.status === 404 || error?.message?.includes("NOT_FOUND") || error?.message?.includes("no longer available")) {
+          if (fallbackIndex < fallbacks.length) {
+             console.warn(`Model ${params.model} not found. Falling back to ${fallbacks[fallbackIndex]}`);
+             params.model = fallbacks[fallbackIndex++];
+             delayMs = 1000;
           } else {
-            delayMs = Math.max(delayMs, 30000); // Default to at least 30s for generic 429
+             throw error;
+          }
+        } else if (error?.status === 503 || error?.message?.includes("503") || error?.message?.includes("high demand") || error?.message?.includes("UNAVAILABLE") || error?.status === 429 || error?.message?.includes("429") || error?.message?.includes("Quota exceeded") || error?.message?.includes("RESOURCE_EXHAUSTED")) {
+          // If it's a daily limit error or a 503 high demand error, fallback to another model
+          if (error?.message?.includes("GenerateRequestsPerDayPerProjectPerModel") || error?.message?.includes("limit: 20") || error?.status === 503 || error?.message?.includes("503") || error?.message?.includes("high demand") || error?.message?.includes("UNAVAILABLE")) {
+             if (fallbackIndex < fallbacks.length) {
+               console.warn(`High demand or hard quota hit for ${params.model}. Falling back to ${fallbacks[fallbackIndex]}`);
+               params.model = fallbacks[fallbackIndex++];
+               delayMs = 2000; // Fast retry with new model
+             } else {
+               const e = new Error(error.message);
+               (e as any).status = error?.status || 429;
+               (e as any).isQuotaError = true;
+               throw e;
+             }
+          } else {
+            const retryMatch = error?.message?.match(/retry in (\d+(?:\.\d+)?)s/);
+            if (retryMatch && retryMatch[1]) {
+              delayMs = parseFloat(retryMatch[1]) * 1000 + 3000; // Exact wait time + 3s buffer
+            } else {
+              delayMs = Math.max(delayMs, 10000); // Default to at least 10s for generic 429/503
+            }
           }
         }
         
@@ -125,9 +239,9 @@ async function generateContentWithRetry(params: any, customApiKey?: string, retr
         await new Promise(resolve => setTimeout(resolve, delayMs));
       } else {
         // If it's the last retry or unretryable and it's a quota error, throw it so we can return a specific response to the client
-        if (error?.status === 429 || error?.message?.includes("429") || error?.message?.includes("Quota exceeded") || error?.message?.includes("RESOURCE_EXHAUSTED")) {
+        if (error?.status === 429 || error?.message?.includes("429") || error?.message?.includes("Quota exceeded") || error?.message?.includes("RESOURCE_EXHAUSTED") || error?.status === 503 || error?.message?.includes("503") || error?.message?.includes("UNAVAILABLE")) {
            const e = new Error(error.message);
-           (e as any).status = 429;
+           (e as any).status = error?.status || 429;
            (e as any).isQuotaError = true;
            throw e;
         }
@@ -358,10 +472,7 @@ Chunks:
 ${batch.map(c => `--- CHUNK ID: ${c.id} (Source ID: ${c.sourceId}, Name: ${c.sourceName}) ---\n${c.text}`).join("\n\n")}`;
 
         try {
-            const response = await generateContentWithRetry({
-               model: (req.headers["x-gemini-model"] as string) || "gemini-3.5-flash",
-               contents: prompt,
-               config: {
+            const response = await generateContentWithRetry({ model: (req.headers["x-gemini-model"] as string) || "gemini-3.5-flash", contents: prompt, config: {
                   responseMimeType: "application/json",
                   responseSchema: {
                       type: Type.ARRAY,
@@ -379,7 +490,7 @@ ${batch.map(c => `--- CHUNK ID: ${c.id} (Source ID: ${c.sourceId}, Name: ${c.sou
                       }
                   }
                }
-            }, req.headers["x-gemini-api-key"] as string);
+            }, req.headers["x-gemini-api-key"] as string, req.headers["x-api-base-url"] as string);
             
             const batchMeta = JSON.parse(response.text || "[]");
             analyzedChunksMetadata.push(...batchMeta);
@@ -438,7 +549,7 @@ ${JSON.stringify(analyzedChunksMetadata, null, 2)}`;
                    }
                }
            }
-        }, req.headers["x-gemini-api-key"] as string);
+        }, req.headers["x-gemini-api-key"] as string, req.headers["x-api-base-url"] as string);
         dupResult = JSON.parse(dupResponse.text || "{}");
     } catch (e) {
         console.error("Error in duplicate detection:", e);
@@ -513,10 +624,10 @@ ${JSON.stringify(dupResult, null, 2)}`;
              required: ["title", "chapters"]
            }
        }
-    }, req.headers["x-gemini-api-key"] as string);
+    }, req.headers["x-gemini-api-key"] as string, req.headers["x-api-base-url"] as string);
     
     const outline = JSON.parse(outlineResponse.text || "{}");
-    sendEvent("complete", { outline });
+    sendEvent("complete", { outline, usageMetadata: outlineResponse.usageMetadata });
     res.end();
   } catch (error: any) {
     console.error("Error in AI Architect Stream:", error);
@@ -541,10 +652,7 @@ Identify major topics, chapters, and sections.
 
 ${sourceContents}`;
 
-    const response = await generateContentWithRetry({
-      model: (req.headers["x-gemini-model"] as string) || "gemini-3.5-flash",
-      contents: prompt,
-      config: {
+    const response = await generateContentWithRetry({ model: (req.headers["x-gemini-model"] as string) || "gemini-3.5-flash", contents: prompt, config: {
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -577,10 +685,10 @@ ${sourceContents}`;
           required: ["chapters"]
         }
       }
-    }, req.headers["x-gemini-api-key"] as string);
+    }, req.headers["x-gemini-api-key"] as string, req.headers["x-api-base-url"] as string);
 
     const result = JSON.parse(response.text || "{}");
-    res.json(result);
+    res.json({ ...result, usageMetadata: response.usageMetadata });
   } catch (error: any) {
     console.error("Error in AI Architect:", error);
     if (error?.status === 429 || error?.isQuotaError) {
@@ -612,11 +720,21 @@ IMPORTANT STYLING REQUIREMENTS (You must use these raw HTML structures instead o
 4. For text highlights: <span class="highlight">yellow</span> or <span class="highlight-cyan">cyan</span>
 5. For Interview Q&A (if applicable): <div class="interview-section"><div class="interview-title">Interview Question</div><div class="interview-q">Q: question?</div><div class="interview-a">A: answer...</div></div>
 6. For ASCII diagrams: <div class="diagram-box">ascii diagram here...</div><div class="diagram-caption">Caption here</div>
-7. For Procedures, Workflows & Step Logic: Use structured ordered lists (<ol>), bullet points (<ul>), or spec callouts. Do NOT generate flowcharts, sequence diagrams, or mermaid blocks.
+7. For Procedures, Workflows, Architectures & System Diagrams:
+- If the source notes contain Mermaid diagrams (\`\`\`mermaid ... \`\`\`) or describe system architectures, data flows, sequences, state transitions, or cloud services:
+  RENDER THEM as valid Mermaid diagrams:
+  <figure class="notebook-figure diagram-container">
+    <div class="diagram-badge">SYSTEM ARCHITECTURE & WORKFLOW</div>
+    <pre class="mermaid">
+    ...mermaid code...
+    </pre>
+    <figcaption>Architecture Description</figcaption>
+  </figure>
+- Always preserve any user-provided Mermaid code blocks exactly.
 8. For User Images & Figures (When source material contains an image or screenshot tag, preserve it exactly):
 <figure class="notebook-figure">
   <img src="EXACT_IMAGE_URL" alt="Description" />
-  <figcaption>Figure: Caption description</figcaption>
+  <figcaption>Caption description</figcaption>
 </figure>
 
 Do not blindly copy everything. Remove obvious duplication. Preserve important technical details. Maintain factual meaning.
@@ -626,12 +744,23 @@ Do not include the main section title at the top, just the content itself.
 SOURCES:
 ${sourceContents}`;
 
+    // START KEEP-ALIVE
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Transfer-Encoding", "chunked");
+    res.flushHeaders();
+    const keepAlive = setInterval(() => {
+      res.write(" "); // Write space to keep connection alive
+      if (typeof (res as any).flush === "function") (res as any).flush();
+    }, 10000);
+    // END KEEP-ALIVE
+
     const response = await generateContentWithRetry({
       model: (req.headers["x-gemini-model"] as string) || "gemini-3.5-flash",
       contents: prompt
-    }, req.headers["x-gemini-api-key"] as string);
+    }, req.headers["x-gemini-api-key"] as string, req.headers["x-api-base-url"] as string);
+    clearInterval(keepAlive);
 
-    res.json({ content: stripFlowchartDiagrams(response.text) });
+    res.json({ content: processAndFormatMermaidDiagrams(response.text), usageMetadata: response.usageMetadata });
   } catch (error: any) {
     console.error("Error in generate-section:", error);
     if (error?.status === 429 || error?.isQuotaError) {
@@ -667,17 +796,26 @@ CRITICAL INSTRUCTION: You MUST strictly use the provided content. Do not generat
   Format them primarily with clean, structured ordered lists (<ol>) or unordered lists (<ul>), or enclose them in a <div class="spec-card"><div class="spec-badge">ACCEPTANCE CRITERIA</div><ol>...</ol></div>. Preserve nested sub-points cleanly!
 - Only use <table> when data is genuinely tabular (e.g. commands & flags, configuration parameters, or action-to-state mapping matrices).
 - If using <table>, ensure column headers are concise and balanced. Columns adjust dynamically; never squeeze long descriptive sentences into rigid narrow columns.
-7. PROCEDURES, WORKFLOWS & DECISION LOGIC:
-- STRICT MANDATE: NO FLOWCHARTS OR MERMAID DIAGRAMS. Do NOT generate flowcharts, sequence diagrams, or mermaid syntax blocks.
-- When notes describe workflows, user journeys, decision trees, or system lifecycles:
-  Format them as clear, readable numbered steps (<ol>), structured bullet lists (<ul>), or a clear decision table (<table>) mapping condition to action.
+7. PROCEDURES, WORKFLOWS & ARCHITECTURE DIAGRAMS (MERMAID FULLY SUPPORTED):
+- If the raw notes contain any Mermaid diagrams (\`\`\`mermaid ... \`\`\`) or describe system architecture, service interactions, data flow, sequence workflows, cloud infrastructure, or state machines:
+  YOU MUST RENDER THEM AS A NATIVE MERMAID DIAGRAM!
+  Format it wrapped inside a notebook figure with pre.mermaid:
+  <figure class="notebook-figure diagram-container">
+    <div class="diagram-badge">SYSTEM ARCHITECTURE & WORKFLOW</div>
+    <pre class="mermaid">
+flowchart TD
+  ...valid mermaid code...
+    </pre>
+    <figcaption>Architecture Flow Diagram</figcaption>
+  </figure>
+- Preserve every user-provided Mermaid diagram block cleanly. Ensure Mermaid syntax is valid (e.g. flowchart TD, sequenceDiagram, classDiagram, erDiagram).
 8. USER-PASTED IMAGES & FIGURES (CRITICAL MANDATE):
 - If the raw notes contain any pasted images, markdown images ![alt](url), or HTML &lt;img src="..." ...&gt; or &lt;figure&gt;...&lt;/figure&gt;:
   You MUST PRESERVE EVERY IMAGE! Place each image in its relevant context within the chapter.
   Wrap each image in the notebook figure container:
   <figure class="notebook-figure">
     <img src="EXACT_IMAGE_URL" alt="Descriptive alt text" />
-    <figcaption>Figure: Meaningful title or caption for the image</figcaption>
+    <figcaption>Meaningful title or caption for the image</figcaption>
   </figure>
 - CRITICAL: Never omit or delete user image URLs. Always retain the exact src URL (e.g. /uploads/img_xxx.png or data:image/...).
 
@@ -695,6 +833,18 @@ Follow this exact structural template for the content:
   <div class="note-badge">SOURCE NOTE</div>
   <p>Your important note here...</p>
 </div>
+
+<!-- For System Architecture, Component Flows, or Sequence Diagrams: -->
+<figure class="notebook-figure diagram-container">
+  <div class="diagram-badge">SYSTEM ARCHITECTURE & WORKFLOW</div>
+  <pre class="mermaid">
+flowchart TD
+  Client[Client Layer] --> API[API Gateway]
+  API --> Service[Backend Service]
+  Service --> DB[(Database)]
+  </pre>
+  <figcaption>System Interaction & Architecture Pipeline</figcaption>
+</figure>
 
 <!-- For Workflows, Step-by-Step Procedures, or Execution Logic -->
 <div class="spec-card">
@@ -742,23 +892,92 @@ Follow this exact structural template for the content:
 <!-- For User-Pasted Images or Screenshots: -->
 <figure class="notebook-figure">
   <img src="IMAGE_URL" alt="Diagram / Screenshot" />
-  <figcaption>Figure: Caption describing the diagram or screenshot</figcaption>
+  <figcaption>Caption describing the diagram or screenshot</figcaption>
 </figure>
 
-### COMPLETE DESIGN SYSTEM & CSS SPECIFICATION:
-Integrate the exact CSS below into the <head> of every document:
+### HTML STRUCTURE:
+Follow this exact structural template for the output content:
 
-<!DOCTYPE html>
+<header style="text-align: center;">
+  <h1 class="notebook-title">${chapterTitle}</h1>
+  <div class="subtitle">Notes and Documentation</div>
+  <hr class="header-divider" />
+</header>
+<!-- CONTENT CHAPTERS GO HERE -->
+
+Convert the attached notes into raw HTML content following the notebook styles.
+DO NOT OUTPUT ANY CSS. DO NOT OUTPUT <head> or <body> tags or <!DOCTYPE html>. Output ONLY the raw inner HTML content starting with the <header> tag, nothing else.
+Use the chapter title "${chapterTitle}" as the main Title.
+STRICTLY base the content ONLY on the RAW NOTES provided below. Do not invent new content.
+
+RAW NOTES:
+${rawText}`;
+
+  try {
+    // START KEEP-ALIVE
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Transfer-Encoding", "chunked");
+    res.flushHeaders();
+    const keepAlive = setInterval(() => {
+      res.write(" "); // Write space to keep connection alive
+      if (typeof (res as any).flush === "function") (res as any).flush();
+    }, 10000);
+    // END KEEP-ALIVE
+
+    const response = await generateContentWithRetry({
+      model: (req.headers["x-gemini-model"] as string) || "gemini-3.5-flash",
+      contents: prompt
+    }, req.headers["x-gemini-api-key"] as string, req.headers["x-api-base-url"] as string);
+    
+    // Clean up potential markdown formatting from Gemini
+        let content = response.text;
+    if (content.startsWith("```html")) {
+      content = content.replace(/^\`\`\`html\n/, "").replace(/\n\`\`\`$/, "");
+    } else if (content.startsWith("```")) {
+      content = content.replace(/^\`\`\`\n/, "").replace(/\n\`\`\`$/, "");
+    }
+    
+    // Inject the boilerplate CSS and HTML structure around the generated content to save LLM tokens
+    const boilerplateTop = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${chapterTitle} - Engineering Systems Manual</title>
+  <title>\${chapterTitle} - Engineering Systems Manual</title>
   
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Patrick+Hand&family=Patrick+Hand+SC&display=swap" rel="stylesheet">
-
+  
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="/vendor/mermaid.min.js"></script>
+  <script>
+    function applyHighlights() {
+      if (typeof hljs !== 'undefined') hljs.highlightAll();
+       document.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(h => {
+        if (h.textContent.trim().toLowerCase().includes('description')) {
+          h.style.color = '#8b5cf6';
+        }
+      });
+      if (typeof mermaid !== 'undefined') {
+        try {
+          mermaid.initialize({
+            startOnLoad: false,
+            theme: 'neutral',
+            securityLevel: 'loose',
+            fontFamily: "'Patrick Hand', cursive, sans-serif"
+          });
+          mermaid.run({ querySelector: '.mermaid' });
+        } catch(e) { console.error('Mermaid render error:', e); }
+      }
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', applyHighlights);
+    } else {
+      applyHighlights();
+    }
+  </script>
   <style>
     :root {
       --bg-desk: #f4eee1;
@@ -770,9 +989,7 @@ Integrate the exact CSS below into the <head> of every document:
       --border-dark: #2d3748;
       --shadow-color: rgba(0, 0, 0, 0.08);
     }
-
     * { box-sizing: border-box; margin: 0; padding: 0; }
-
     body {
       background-color: var(--bg-desk);
       font-family: 'Patrick Hand', cursive;
@@ -781,7 +998,6 @@ Integrate the exact CSS below into the <head> of every document:
       color: var(--ink-black);
       padding: 2rem 1rem;
     }
-
     .notebook-container {
       width: 816px; /* 8.5 inches at 96 DPI */
       max-width: 100%;
@@ -798,16 +1014,13 @@ Integrate the exact CSS below into the <head> of every document:
       box-shadow: 0 10px 25px var(--shadow-color);
       border: 1px solid var(--paper-line);
     }
-
     header {
       margin-bottom: 2rem;
       text-align: center;
     }
-
     .book-tag {
       display: none !important;
     }
-
     h1.notebook-title {
       font-family: 'Patrick Hand SC', cursive;
       font-size: 3rem;
@@ -816,7 +1029,6 @@ Integrate the exact CSS below into the <head> of every document:
       margin: 0 auto 0.5rem auto;
       text-align: center;
     }
-
     .subtitle {
       font-size: 1.35rem;
       color: #64748b;
@@ -825,7 +1037,6 @@ Integrate the exact CSS below into the <head> of every document:
       text-align: center;
       max-width: 820px;
     }
-
     .header-divider {
       border: none;
       border-bottom: 3px dashed var(--ink-blue);
@@ -833,7 +1044,6 @@ Integrate the exact CSS below into the <head> of every document:
       opacity: 0.7;
       max-width: 100%;
     }
-
     h2 {
       font-family: 'Patrick Hand SC', cursive;
       font-size: 2rem;
@@ -842,14 +1052,12 @@ Integrate the exact CSS below into the <head> of every document:
       border-bottom: 1.5px solid var(--paper-line);
       padding-bottom: 0.25rem;
     }
-
     h3 {
       font-family: 'Patrick Hand SC', cursive;
       font-size: 1.5rem;
       color: var(--ink-black);
       margin: 1.5rem 0 0.5rem;
     }
-
     p { margin-bottom: 1rem; }
     ul, ol {
       margin: 0.75rem 0 1.5rem 2rem;
@@ -866,7 +1074,6 @@ Integrate the exact CSS below into the <head> of every document:
     ol ol, ul ul, ol ul, ul ol {
       margin: 0.35rem 0 0.5rem 1.5rem;
     }
-
     /* SPECIFICATION & ACCEPTANCE CRITERIA CARD */
     .spec-card {
       background: transparent;
@@ -876,7 +1083,6 @@ Integrate the exact CSS below into the <head> of every document:
       margin: 2rem 0;
       position: relative;
     }
-
     .spec-badge {
       background: #e0e7ff;
       color: #3730a3;
@@ -890,7 +1096,6 @@ Integrate the exact CSS below into the <head> of every document:
       margin-bottom: 1rem;
       box-shadow: 2px 2px 0 rgba(0,0,0,0.1);
     }
-
     code {
       font-family: 'Fira Code', monospace;
       font-size: 0.9em;
@@ -900,7 +1105,6 @@ Integrate the exact CSS below into the <head> of every document:
       border-radius: 6px;
       word-break: break-word;
     }
-
     pre {
       background: #1e293b;
       color: #e2e8f0;
@@ -914,7 +1118,6 @@ Integrate the exact CSS below into the <head> of every document:
       font-size: 0.92rem;
       line-height: 1.6;
     }
-
     pre code {
       background: transparent;
       padding: 0;
@@ -923,117 +1126,83 @@ Integrate the exact CSS below into the <head> of every document:
       font-size: inherit;
       line-height: inherit;
     }
-
     /* SOURCE NOTE CARD */
     .source-note-card {
       background: transparent;
       border: 2px solid var(--border-dark);
       border-radius: 8px;
       padding: 1.5rem 1.75rem;
-      margin: 2.5rem 0;
-      position: relative;
+      margin: 2.5rem 0;      position: relative;
     }
-
     .note-badge {
       background: #fde047;
       border: 1px solid var(--border-dark);
       border-radius: 4px;
       padding: 0.2rem 0.75rem;
       font-family: 'Patrick Hand SC', cursive;
-      font-size: 0.9rem;
-      font-weight: bold;
+      font-size: 0.9rem;      font-weight: bold;
       display: inline-block;
-      margin-bottom: 1rem;
-      box-shadow: 2px 2px 0 rgba(0,0,0,0.1);
+      margin-bottom: 1rem;      box-shadow: 2px 2px 0 rgba(0,0,0,0.1);
     }
-
     /* TABLES (DYNAMIC AUTO SIZING, NO ZERO-WIDTH CRUSHING) */
     table {
-      width: 100%;
-      border-collapse: collapse;
-      margin: 2rem 0;
-      background: transparent;
-      border: 1.5px solid var(--paper-line);
-      border-radius: 8px;
-      overflow: hidden;
-      table-layout: auto;
+      width: 100%;      border-collapse: collapse;      margin: 2rem 0;      background: transparent;
+      border: 1.5px solid var(--paper-line);      border-radius: 8px;      overflow: hidden;      table-layout: auto;
     }
-
     th {
-      font-family: 'Patrick Hand SC', cursive;
-      color: #3730a3;
-      text-align: left;
-      padding: 0.85rem 1.15rem;
-      border-bottom: 1.5px solid var(--paper-line);
-      border-right: 1px solid var(--paper-line);
-      background: #eef2ff;
-      font-size: 1.15rem;
-      letter-spacing: 0.5px;
-      vertical-align: top;
+      font-family: 'Patrick Hand SC', cursive;      color: #3730a3;      text-align: left;
+      padding: 0.85rem 1.15rem;      border-bottom: 1.5px solid var(--paper-line);      border-right: 1px solid var(--paper-line);
+      background: #eef2ff;      font-size: 1.15rem;      letter-spacing: 0.5px;      vertical-align: top;
       word-break: normal;
     }
-
     th:last-child {
       border-right: none;
     }
-
     td {
-      padding: 0.85rem 1.15rem;
-      border-bottom: 1px solid var(--paper-line);
-      border-right: 1px solid var(--paper-line);
-      color: #1e1e24;
-      line-height: 1.6;
-      vertical-align: top;
-      word-break: normal;
+      padding: 0.85rem 1.15rem;      border-bottom: 1px solid var(--paper-line);      border-right: 1px solid var(--paper-line);
+      color: #1e1e24;      line-height: 1.6;      vertical-align: top;      word-break: normal;
       overflow-wrap: break-word;
     }
-
     td:last-child {
       border-right: none;
     }
-    
     h2 {
       display: inline-block;
       background: linear-gradient(120deg, rgba(254, 240, 138, 0.7) 0%, rgba(254, 240, 138, 0.7) 100%);
-      background-repeat: no-repeat;
-      background-size: 100% 35%;
-      background-position: 0 85%;
-      padding-right: 0.5rem;
-      padding-left: 0.2rem;
+      background-repeat: no-repeat;      background-size: 100% 35%;      background-position: 0 85%;
+      padding-right: 0.5rem;      padding-left: 0.2rem;
     }
-
     tr:last-child td { border-bottom: none; }
-
-    /* NOTEBOOK IMAGE & FIGURE STYLES */
-    .notebook-figure {
-      background: #ffffff;
-      border: 2px solid var(--border-dark);
-      border-radius: 8px;
-      padding: 1.25rem 1.5rem;
-      margin: 2.5rem 0;
-      text-align: center;
-      box-shadow: 4px 5px 0 var(--shadow-color);
-      break-inside: avoid;
-      page-break-inside: avoid;
+    /* NOTEBOOK IMAGE, DIAGRAM & FIGURE STYLES */
+    .notebook-figure, .diagram-container {
+      background: #ffffff;      border: 2px solid var(--border-dark);      border-radius: 8px;
+      padding: 1.25rem 1.5rem;      margin: 2.5rem 0;      text-align: center;
+      box-shadow: 4px 5px 0 var(--shadow-color);      break-inside: avoid;      page-break-inside: avoid;
+      position: relative;
     }
-
+    .diagram-badge {
+      background: #e0e7ff;      color: #3730a3;      border: 1px solid var(--border-dark);
+      border-radius: 4px;      padding: 0.2rem 0.75rem;      font-family: 'Patrick Hand SC', cursive;
+      font-size: 0.9rem;      font-weight: bold;      display: inline-block;
+      margin-bottom: 1rem;      box-shadow: 2px 2px 0 rgba(0,0,0,0.1);
+    }
+    .mermaid {
+      background: transparent !important;      display: flex !important;      justify-content: center !important;
+      align-items: center !important;      margin: 0.5rem auto !important;      overflow-x: auto !important;
+      width: 100% !important;      font-family: 'Patrick Hand', cursive, sans-serif !important;
+    }
+    .mermaid svg {
+      max-width: 100% !important;      height: auto !important;      display: block !important;
+      margin: 0 auto !important;
+    }
     .notebook-figure img, img {
-      max-width: 100% !important;
-      height: auto !important;
-      border-radius: 6px;
-      display: block;
-      margin: 0 auto;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+      max-width: 100% !important;      height: auto !important;      border-radius: 6px;
+      display: block;      margin: 0 auto;      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
     }
-
     .notebook-figure figcaption {
-      font-family: 'Patrick Hand', cursive;
-      font-size: 1.05rem;
-      color: #64748b;
-      margin-top: 1rem;
-      font-style: italic;
+      font-family: 'Patrick Hand', cursive;      font-size: 1.05rem;      color: #64748b;
+      margin-top: 1rem;      font-style: italic;
     }
-
     /* Print Formatting */
     @media print {
       html, body {
@@ -1050,44 +1219,21 @@ Integrate the exact CSS below into the <head> of every document:
         print-color-adjust: exact !important;
       }
       .source-note-card, pre, table, tr, .notebook-figure, img {
-        break-inside: avoid;
-        page-break-inside: avoid;
+        break-inside: avoid;        page-break-inside: avoid;
       }
     }
   </style>
 </head>
-
 <body>
   <div class="notebook-container">
-    <header style="text-align: center;">
-      <h1 class="notebook-title">${chapterTitle}</h1>
-      <div class="subtitle">Notes and Documentation</div>
-      <hr class="header-divider" />
-    </header>
-
-    <!-- CONTENT CHAPTERS GO HERE -->
-
+`;
+    const boilerplateBottom = `
   </div>
 </body>
-</html>
-
-Convert the attached notes into a complete HTML document in the notebook format defined above.
-Use the chapter title "${chapterTitle}" as the main Title.
-STRICTLY base the content ONLY on the RAW NOTES provided below. Do not invent new content.
-
-RAW NOTES:
-${rawText}`;
-
-  try {
-    const response = await generateContentWithRetry({
-      model: (req.headers["x-gemini-model"] as string) || "gemini-3.5-flash",
-      contents: prompt
-    }, req.headers["x-gemini-api-key"] as string);
+</html>`;
     
-    // Clean up potential markdown formatting from Gemini
-    let content = response.text;
-    if (content.startsWith("```html")) {
-      content = content.replace(/^\`\`\`html\n/, "").replace(/\n\`\`\`$/, "");
+    if (!content.includes("<body")) {
+      content = boilerplateTop + content + boilerplateBottom;
     } else if (content.startsWith("```")) {
       content = content.replace(/^\`\`\`\n/, "").replace(/\n\`\`\`$/, "");
     }
@@ -1106,7 +1252,26 @@ ${rawText}`;
 
     for (const img of foundImages) {
       if (!content.includes(img.url)) {
-        const figureBlock = `\n<figure class="notebook-figure">\n  <img src="${img.url}" alt="${img.alt}" />\n  <figcaption>Figure: ${img.alt || 'Pasted image'}</figcaption>\n</figure>\n`;
+        const figureBlock = `\n<figure class="notebook-figure">\n  <img src="${img.url}" alt="${img.alt}" />\n  <figcaption>${img.alt || 'Pasted image'}</figcaption>\n</figure>\n`;
+        if (content.includes("</body>")) {
+          content = content.replace("</body>", `${figureBlock}</body>`);
+        } else if (content.includes("</div>")) {
+          const lastDivIndex = content.lastIndexOf("</div>");
+          content = content.substring(0, lastDivIndex) + figureBlock + content.substring(lastDivIndex);
+        } else {
+          content += figureBlock;
+        }
+      }
+    }
+
+    // Safety net: ensure any Mermaid diagrams in raw notes are preserved in the HTML output
+    const mermaidRegex = /```mermaid\s*([\s\S]*?)\s*```/gi;
+    let mMatch;
+    while ((mMatch = mermaidRegex.exec(rawText)) !== null) {
+      const chart = mMatch[1].trim();
+      const chartSnippet = chart.substring(0, 35);
+      if (!content.includes(chartSnippet)) {
+        const figureBlock = `\n<figure class="notebook-figure diagram-container">\n  <div class="diagram-badge">SYSTEM ARCHITECTURE & WORKFLOW</div>\n  <pre class="mermaid">\n${chart}\n  </pre>\n  <figcaption>System Architecture & Workflow</figcaption>\n</figure>\n`;
         if (content.includes("</body>")) {
           content = content.replace("</body>", `${figureBlock}</body>`);
         } else if (content.includes("</div>")) {
@@ -1118,31 +1283,40 @@ ${rawText}`;
       }
     }
     
-    content = stripFlowchartDiagrams(content);
-    res.json({ content });
-  } catch (error) {
+    content = processAndFormatMermaidDiagrams(content);
+    res.write(JSON.stringify({ content, usageMetadata: response.usageMetadata }));
+    res.end();
+  } catch (error: any) {
     console.error("Error in format-direct:", error);
-    if (error?.status === 429 || error?.isQuotaError) {
-      return res.status(429).json({ error: "QUOTA_EXCEEDED", message: error.message });
+    if (!res.headersSent) {
+       if (error?.status === 429 || error?.isQuotaError) {
+         return res.status(429).json({ error: "QUOTA_EXCEEDED", message: error.message });
+       }
+       return res.status(500).json({ error: error.message });
+    } else {
+       if (error?.status === 429 || error?.isQuotaError) {
+         res.write(JSON.stringify({ error: "QUOTA_EXCEEDED", message: error.message }));
+       } else {
+         res.write(JSON.stringify({ error: error.message }));
+       }
+       res.end();
     }
-    res.status(500).json({ error: error.message });
   }
 });
 
-// Helper to remove any residual flowchart / mermaid diagram artifacts and unwanted book-tags
-function stripFlowchartDiagrams(html: string): string {
+// Helper to safely preserve and format Mermaid diagrams and purge unwanted book-tag banners
+function processAndFormatMermaidDiagrams(html: string): string {
   if (!html) return "";
-  let cleaned = html
-    .replace(/<pre[^>]*class=["'][^"']*mermaid[^"']*["'][^>]*>[\s\S]*?<\/pre>/gi, "")
-    .replace(/<div[^>]*class=["'][^"']*mermaid[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, "")
-    .replace(/```mermaid[\s\S]*?```/gi, "")
-    .replace(/<script[^>]*src=["'][^"']*mermaid[^"']*["'][^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<script[^>]*>[\s\S]*?mermaid[\s\S]*?<\/script>/gi, "")
-    .replace(/<div[^>]*class=["'][^"']*diagram-container[^"']*["'][^>]*>[\s\S]*?<\/div>\s*<\/div>/gi, "")
-    .replace(/<div[^>]*class=["'][^"']*diagram-container[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, "")
-    .replace(/<div[^>]*class=["'][^"']*(?:diagram-badge|diagram-caption)[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, "")
-    .replace(/<div[^>]*class=["'][^"']*book-tag[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, "");
-  return cleaned;
+  let processed = html;
+
+  // Convert raw ```mermaid markdown blocks to standard HTML pre.mermaid containers
+  processed = processed.replace(/```mermaid\s*([\s\S]*?)\s*```/gi, (match, chartCode) => {
+    return `<figure class="notebook-figure diagram-container">\n  <div class="diagram-badge">SYSTEM ARCHITECTURE & WORKFLOW</div>\n  <pre class="mermaid">\n${chartCode.trim()}\n  </pre>\n  <figcaption>Architecture Flow Diagram</figcaption>\n</figure>`;
+  });
+
+  // Only purge top/bottom placeholder book tags, never diagrams
+  processed = processed.replace(/<div[^>]*class=["'][^"']*book-tag[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, "");
+  return processed;
 }
 
 // Optimistic PDF Cache & Warmed Browser Pool
@@ -1161,22 +1335,21 @@ async function getWarmedBrowser(): Promise<any> {
   if (!warmedBrowserPromise) {
     warmedBrowserPromise = (async () => {
       const executablePath = await chromium.executablePath();
+      const args = chromium.args;
+      const headless = chromium.headless;
+      
+      const env = {
+        ...process.env,
+        LD_LIBRARY_PATH: fsSync.existsSync(vendorLibPath)
+          ? `${vendorLibPath}:${process.env.LD_LIBRARY_PATH || ""}`
+          : process.env.LD_LIBRARY_PATH || ""
+      };
+
       const b = await puppeteer.launch({
-        args: [
-          ...chromium.args,
-          '--disable-web-security',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--font-render-hinting=medium'
-        ],
-        // @ts-ignore
-        defaultViewport: chromium.defaultViewport,
-        executablePath: executablePath,
-        // @ts-ignore
-        headless: chromium.headless,
+        args,
+        executablePath,
+        headless,
+        env,
       });
 
       b.on('disconnected', () => {
@@ -1218,7 +1391,7 @@ async function renderHtmlToCompressedPdf(html: string, outputPath: string, title
 
     // Screen media type and 1.5 scale factor for crisp typography with minimal raster bloat
     await page.emulateMediaType('screen');
-    await page.setViewport({ width: 850, height: 1100, deviceScaleFactor: 1.5 });
+    await page.setViewport({ width: 850, height: 1100, deviceScaleFactor: 1.0 });
 
     // Inject base href so relative images (/uploads/...) resolve properly to local server
     let preparedHtml = html;
@@ -1246,9 +1419,29 @@ async function renderHtmlToCompressedPdf(html: string, outputPath: string, title
       }));
     });
 
-    // Cleanly purge any residual flowchart or diagram elements and book-tags prior to taking PDF snapshot
-    await page.evaluate(() => {
-      document.querySelectorAll('.diagram-container, .mermaid, .diagram-badge, .diagram-caption, .book-tag').forEach(el => el.remove());
+    // Ensure all Mermaid diagrams are fully initialized and rendered as vector SVGs
+    await page.evaluate(async () => {
+      if ((window as any).mermaid) {
+        try {
+          (window as any).mermaid.run({ querySelector: '.mermaid' });
+        } catch (e) {}
+      }
+
+      const mermaids = Array.from(document.querySelectorAll('.mermaid'));
+      if (mermaids.length > 0) {
+        let attempts = 0;
+        while (attempts < 50) {
+          const allRendered = mermaids.every(el => 
+            el.querySelector('svg') || el.getAttribute('data-processed') === 'true'
+          );
+          if (allRendered) break;
+          await new Promise(r => setTimeout(r, 100));
+          attempts++;
+        }
+      }
+
+      // Purge only residual top/bottom book-tag banners
+      document.querySelectorAll('.book-tag').forEach(el => el.remove());
     });
 
     const rawPdfBuffer = await page.pdf({
@@ -1278,7 +1471,17 @@ async function renderHtmlToCompressedPdf(html: string, outputPath: string, title
 
     const finalBuffer = Buffer.from(compressedPdfBytes);
     await fs.writeFile(outputPath, finalBuffer);
-
+    
+    // Ghostscript extreme compression pass
+    const gsOutputPath = outputPath.replace('.pdf', '_gs.pdf');
+    try {
+      await execAsync(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dColorImageResolution=150 -dGrayImageResolution=150 -dMonoImageResolution=150 -dColorImageDownsampleType=/Bicubic -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${gsOutputPath} ${outputPath}`);
+      await fs.rename(gsOutputPath, outputPath);
+      console.log("Ghostscript compression successful");
+    } catch (e) {
+      console.error("Ghostscript compression failed, using original", e);
+    }
+    
     return outputPath;
   } finally {
     // Keep browser alive, only close tab
@@ -1495,13 +1698,21 @@ async function generatePdfJob(exportId: string) {
     await updateJobProgress(exportId, "Preparing document");
     
     const executablePath = await chromium.executablePath();
+    const args = chromium.args;
+    const headless = chromium.headless;
+
+    const env = {
+      ...process.env,
+      LD_LIBRARY_PATH: fsSync.existsSync(vendorLibPath)
+        ? `${vendorLibPath}:${process.env.LD_LIBRARY_PATH || ""}`
+        : process.env.LD_LIBRARY_PATH || ""
+    };
+
     const browser = await puppeteer.launch({
-      args: [...chromium.args, '--disable-web-security'],
-      // @ts-ignore
-      defaultViewport: chromium.defaultViewport,
-      executablePath: executablePath,
-      // @ts-ignore
-      headless: chromium.headless,
+      args,
+      executablePath,
+      headless,
+      env,
     });
 
     await updateJobProgress(exportId, "Rendering chapters");
@@ -1511,7 +1722,7 @@ async function generatePdfJob(exportId: string) {
     page.on('console', msg => console.log('PAGE LOG:', msg.text()));
 
     await page.emulateMediaType('screen');
-    await page.setViewport({ width: 850, height: 1100, deviceScaleFactor: 2 });
+    await page.setViewport({ width: 850, height: 1100, deviceScaleFactor: 1.0 });
 
     // Navigate to the render route
     const renderUrl = `http://localhost:${PORT}/render-pdf/${exportId}`;
@@ -1550,7 +1761,21 @@ async function generatePdfJob(exportId: string) {
     await updateJobProgress(exportId, "Finalizing PDF");
 
     await browser.close();
-
+    
+    // Ghostscript extreme compression pass
+    const gsOutputPath = pdfPath.replace('.pdf', '_gs.pdf');
+    try {
+      const { exec } = require("child_process");
+      const util = require("util");
+      const execAsync = util.promisify(exec);
+      await execAsync(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dColorImageResolution=150 -dGrayImageResolution=150 -dMonoImageResolution=150 -dColorImageDownsampleType=/Bicubic -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${gsOutputPath} ${pdfPath}`);
+      const fsSync = require("fs");
+      fsSync.renameSync(gsOutputPath, pdfPath);
+      console.log("Ghostscript compression successful for generatePdfJob");
+    } catch (e) {
+      console.error("Ghostscript compression failed for generatePdfJob, using original", e);
+    }
+    
     const job = pdfExportJobs.get(exportId);
     if (job) {
       job.pdfPath = pdfPath;
@@ -1566,6 +1791,12 @@ async function generatePdfJob(exportId: string) {
 // Fallback for API routes
 app.all("/api/*", (req, res) => {
   res.status(404).json({ error: "API Route not found: " + req.method + " " + req.path });
+});
+
+// Global error handler to prevent HTML stack traces
+app.use((err, req, res, next) => {
+  console.error("Express Error:", err.message);
+  res.status(err.status || 500).json({ error: err.message || "Internal Server Error" });
 });
 
 async function startServer() {

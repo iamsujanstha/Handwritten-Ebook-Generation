@@ -1,23 +1,14 @@
+import { safeFetchJson } from "./safeFetch";
+
 export async function uploadImageFile(file: File | Blob, customName?: string): Promise<{ url: string; filename: string }> {
   const formData = new FormData();
   const filename = customName || (file instanceof File ? file.name : `image_${Date.now()}.png`);
   formData.append("file", file, filename);
 
-  const response = await fetch("/api/upload-image", {
+  return await safeFetchJson<{ url: string; filename: string }>("/api/upload-image", {
     method: "POST",
     body: formData
   });
-
-  if (!response.ok) {
-    let errorMsg = "Failed to upload image";
-    try {
-      const err = await response.json();
-      errorMsg = err.error || errorMsg;
-    } catch (_) {}
-    throw new Error(errorMsg);
-  }
-
-  return await response.json();
 }
 
 export function insertTextAtCursor(
@@ -66,7 +57,7 @@ export async function handleImagePaste(
   try {
     const result = await uploadImageFile(imageFile, `pasted_${Date.now()}.png`);
     const snippet = isHtmlMode
-      ? `\n<figure class="notebook-figure">\n  <img src="${result.url}" alt="Figure" />\n  <figcaption>Figure: Pasted illustration</figcaption>\n</figure>\n`
+      ? `\n<figure class="notebook-figure">\n  <img src="${result.url}" alt="Figure" />\n  <figcaption>Pasted illustration</figcaption>\n</figure>\n`
       : `\n\n![Pasted Image](${result.url})\n\n`;
 
     insertTextAtCursor(textarea, currentValue, snippet, onUpdate);
@@ -107,7 +98,7 @@ export async function handleImageDrop(
   try {
     const result = await uploadImageFile(imageFile);
     const snippet = isHtmlMode
-      ? `\n<figure class="notebook-figure">\n  <img src="${result.url}" alt="${imageFile.name}" />\n  <figcaption>Figure: ${imageFile.name}</figcaption>\n</figure>\n`
+      ? `\n<figure class="notebook-figure">\n  <img src="${result.url}" alt="${imageFile.name}" />\n  <figcaption>${imageFile.name}</figcaption>\n</figure>\n`
       : `\n\n![${imageFile.name}](${result.url})\n\n`;
 
     insertTextAtCursor(textarea, currentValue, snippet, onUpdate);

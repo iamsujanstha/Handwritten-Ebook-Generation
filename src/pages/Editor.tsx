@@ -1,4 +1,5 @@
 import { useSettingsStore } from "../store/useSettingsStore";
+import { generateCacheKey, getCachedNote, setCachedNote } from "../lib/cache";
 import { useState, useEffect, useRef } from "react";
 import { useParams } from "react-router";
 import { useBookStore } from "../store/useBookStore";
@@ -6,13 +7,15 @@ import { Sparkles, Save, BookOpen, Plus, GripVertical, FileText, Upload, ImagePl
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
+import rehypeHighlight from "rehype-highlight";
 import { DragDropContext, Droppable, Draggable, DropResult } from "@hello-pangea/dnd";
 import { v4 as uuidv4 } from "uuid";
 import MermaidDiagram from "../components/MermaidDiagram";
 import { handleImagePaste, handleImageDrop, uploadImageFile, insertTextAtCursor } from "../lib/imageUtils";
+import { safeFetchJson } from "../lib/safeFetch";
 
 export default function Editor() {
-  const { geminiModel, userApiKey } = useSettingsStore();
+  const { geminiModel, userApiKey, apiBaseUrl } = useSettingsStore();
   const { id } = useParams<{ id: string }>();
   const book = useBookStore((state) => state.books.find(b => b.id === id));
   const updateChapters = useBookStore((state) => state.updateChapters);
@@ -22,6 +25,7 @@ export default function Editor() {
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
   
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generateProgress, setGenerateProgress] = useState<number | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState("");
   
@@ -41,21 +45,14 @@ export default function Editor() {
     
     setIsExtracting(true);
     try {
-      const response = await fetch("/api/extract-pdf", {
-        
+      const data = await safeFetchJson<{ text: string }>("/api/extract-pdf", {
         method: "POST",
         body: formData
       });
-      if (!response.ok) throw new Error("Failed to extract PDF");
-      const contentType = response.headers.get("content-type");
-      if (contentType && contentType.indexOf("application/json") === -1) {
-        throw new Error("Your session expired or the server is restarting. Please reload the page to continue.");
-      }
-      const data = await response.json();
       setRawInput(prev => prev + "\n\n" + data.text);
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      alert("Failed to parse PDF");
+      alert("Failed to parse PDF: " + (error?.message || "Unknown error"));
     } finally {
       setIsExtracting(false);
     }
@@ -83,25 +80,63 @@ export default function Editor() {
     }
     
     setIsGenerating(true);
+    setGenerateProgress(0);
+
+    let currentProgress = 0;
+    const progressInterval = setInterval(() => {
+      currentProgress += (95 - currentProgress) * 0.08; 
+      setGenerateProgress(Math.floor(currentProgress));
+    }, 400);
+
     try {
-      const response = await fetch("/api/format-direct", {
-        
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-gemini-model": geminiModel, "x-gemini-api-key": userApiKey },
-        body: JSON.stringify({
-          chapterTitle: activeChapter.title,
-          sectionTitle: activeSection.title,
-          rawText: rawInput
-        })
+      const payload = {
+        chapterTitle: activeChapter.title,
+        sectionTitle: activeSection.title,
+        rawText: rawInput
+      };
+      
+      const cacheKey = await generateCacheKey(payload);
+      const cached = getCachedNote(cacheKey);
+      
+      if (cached) {
+        clearInterval(progressInterval);
+        setGenerateProgress(100);
+        updateSectionContent(id, activeChapter.id, activeSection.id, cached.content);
+        setRawInput("");
+        setIsEditing(false);
+        setTimeout(() => {
+          setIsGenerating(false);
+          setGenerateProgress(null);
+        }, 600);
+        return;
+      }
+      
+      const estimatedTokens = Math.ceil(rawInput.length / 4);
+      useSettingsStore.getState().addTokenUsage({ 
+        promptTokenCount: estimatedTokens, 
+        candidatesTokenCount: 0, 
+        totalTokenCount: estimatedTokens, 
+        hits: 1 
       });
 
-      if (!response.ok) throw new Error("Failed to format content");
-      const contentType = response.headers.get("content-type");
-      if (contentType && contentType.indexOf("application/json") === -1) {
-        throw new Error("Your session expired or the server is restarting. Please reload the page to continue.");
-      }
-      const data = await response.json();
+      const data = await safeFetchJson<{ content: string; usageMetadata?: any }>("/api/format-direct", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-gemini-model": geminiModel, "x-gemini-api-key": userApiKey, "x-api-base-url": apiBaseUrl },
+        body: JSON.stringify(payload)
+      });
       
+      if (data.usageMetadata) {
+        useSettingsStore.getState().addTokenUsage({
+          promptTokenCount: (data.usageMetadata.promptTokenCount || 0) - estimatedTokens,
+          candidatesTokenCount: data.usageMetadata.candidatesTokenCount || 0,
+          totalTokenCount: (data.usageMetadata.totalTokenCount || 0) - estimatedTokens,
+          hits: 0
+        });
+      }
+      
+      clearInterval(progressInterval);
+      setGenerateProgress(100);
+      setCachedNote(cacheKey, { content: data.content });
       updateSectionContent(id, activeChapter.id, activeSection.id, data.content);
       setRawInput(""); // clear after generation
       setIsEditing(false);
@@ -361,8 +396,8 @@ export default function Editor() {
                       </label>
                       {!isEditing && (
                         <label className="cursor-pointer flex items-center px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[10px]">
-                          {isExtracting ? "Extracting..." : <><Upload className="w-3 h-3 mr-1" /> Upload PDF</>}
-                          <input type="file" accept="application/pdf" className="hidden" onChange={handlePdfUpload} disabled={isExtracting} />
+                          {isExtracting ? "Extracting..." : <><Upload className="w-3 h-3 mr-1" /> Upload Doc</>}
+                          <input type="file" accept="application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/markdown,text/plain,.pdf,.doc,.docx,.md,.txt" className="hidden" onChange={handlePdfUpload} disabled={isExtracting} />
                         </label>
                       )}
                     </div>
@@ -403,8 +438,22 @@ export default function Editor() {
                         className="flex items-center justify-center w-full px-6 py-4 bg-slate-900 text-white rounded font-bold uppercase tracking-widest text-sm hover:bg-slate-800 transition-colors disabled:opacity-50"
                       >
                         <Sparkles className="w-5 h-5 mr-2 text-orange-400" />
-                        {isGenerating ? "Formatting to Notebook Style..." : "Generate Styled Chapter"}
+                        {isGenerating ? (generateProgress !== null ? `Formatting Chapter ${generateProgress}%` : "Formatting to Notebook Style...") : "Generate Styled Chapter"}
                       </button>
+                      
+                      {isGenerating && generateProgress !== null && (
+                        <div className="mt-4 w-full">
+                          <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden shadow-inner">
+                            <div 
+                              className="bg-orange-500 h-2 rounded-full transition-all duration-300 ease-out" 
+                              style={{ width: `${generateProgress}%` }}
+                            ></div>
+                          </div>
+                          <p className="text-center text-xs text-slate-500 mt-2 font-medium tracking-wide animate-pulse">
+                            {generateProgress < 100 ? "AI is processing your content..." : "Finalizing..."}
+                          </p>
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -416,12 +465,28 @@ export default function Editor() {
                     <div className="max-w-3xl mx-auto">
                        <ReactMarkdown 
                           remarkPlugins={[remarkGfm]}
-                          rehypePlugins={[rehypeRaw]}
+                          rehypePlugins={[rehypeRaw, rehypeHighlight]}
                           components={{
+    h1: ({node, ...props}: any) => {
+      const text = String(props.children);
+      const isDesc = text.toLowerCase().includes("description");
+      return <h1 {...props} style={isDesc ? { color: "#8b5cf6" } : {}}>{props.children}</h1>;
+    },
+    h2: ({node, ...props}: any) => {
+      const text = String(props.children);
+      const isDesc = text.toLowerCase().includes("description");
+      return <h2 {...props} style={isDesc ? { color: "#8b5cf6" } : {}}>{props.children}</h2>;
+    },
+    h3: ({node, ...props}: any) => {
+      const text = String(props.children);
+      const isDesc = text.toLowerCase().includes("description");
+      return <h3 {...props} style={isDesc ? { color: "#8b5cf6" } : {}}>{props.children}</h3>;
+    },
+  
                             img: ({ node, ...props }) => (
                               <figure className="notebook-figure my-6 p-4 bg-white border-2 border-slate-700 rounded-lg shadow-[3px_3px_0px_rgba(0,0,0,0.1)] text-center break-inside-avoid">
-                                <img {...props} className="max-w-full h-auto mx-auto rounded shadow-xs" alt={props.alt || "Figure"} />
-                                {props.alt && <figcaption className="font-['Patrick_Hand'] text-slate-500 italic mt-2 text-sm">Figure: {props.alt}</figcaption>}
+                                <img {...props} className="max-w-full h-auto mx-auto rounded shadow-xs" alt={props.alt || "Image"} />
+                                {props.alt && <figcaption className="font-['Patrick_Hand'] text-slate-500 italic mt-2 text-sm">{props.alt}</figcaption>}
                               </figure>
                             ),
                             code({ node, inline, className, children, ...props }: any) {

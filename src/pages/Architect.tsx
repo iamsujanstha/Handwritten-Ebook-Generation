@@ -8,7 +8,7 @@ import { Sparkles, Save, GripVertical, Trash2, Plus, Edit2, CheckCircle2, Circle
 import { DragDropContext, Droppable, Draggable, DropResult } from "@hello-pangea/dnd";
 
 export default function Architect() {
-  const { geminiModel, userApiKey } = useSettingsStore();
+  const { geminiModel, userApiKey, apiBaseUrl } = useSettingsStore();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const book = useBookStore((state) => state.books.find(b => b.id === id));
@@ -39,10 +39,19 @@ export default function Architect() {
     setShowOptions(false);
 
     try {
+      const textToEstimate = book.sources.filter(s => s.extractionStatus === "Completed").map(s => s.content).join(" ");
+      const estimatedTokens = Math.ceil(textToEstimate.length / 4);
+      useSettingsStore.getState().addTokenUsage({ 
+        promptTokenCount: estimatedTokens, 
+        candidatesTokenCount: 0, 
+        totalTokenCount: estimatedTokens, 
+        hits: 1 
+      });
+
       const response = await fetch("/api/architect-stream", {
         
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-gemini-model": geminiModel, "x-gemini-api-key": userApiKey },
+        headers: { "Content-Type": "application/json", "x-gemini-model": geminiModel, "x-gemini-api-key": userApiKey, "x-api-base-url": apiBaseUrl },
         body: JSON.stringify({ 
           title: book.title,
           description: book.description,
@@ -55,7 +64,19 @@ export default function Architect() {
         })
       });
 
-      if (!response.ok) throw new Error("Failed to start analysis");
+      if (!response.ok) {
+        let errText = "Failed to start analysis";
+        try {
+          const text = await response.text();
+          if (text.includes("<!doctype html>") || text.includes("<html")) {
+            errText = "Server is currently busy or restarting. Please try again in a moment.";
+          } else {
+            const errObj = JSON.parse(text);
+            errText = errObj.error || errObj.message || errText;
+          }
+        } catch (_) {}
+        throw new Error(errText);
+      }
 
       const reader = response.body?.getReader();
       const decoder = new TextDecoder("utf-8");
@@ -100,7 +121,18 @@ export default function Architect() {
                });
 
             } else if (eventType === "complete") {
-               const outlineData = JSON.parse(data).outline;
+               const parsedData = JSON.parse(data);
+               const outlineData = parsedData.outline;
+               
+               if (parsedData.usageMetadata) {
+                 useSettingsStore.getState().addTokenUsage({
+                   promptTokenCount: (parsedData.usageMetadata.promptTokenCount || 0) - estimatedTokens,
+                   candidatesTokenCount: parsedData.usageMetadata.candidatesTokenCount || 0,
+                   totalTokenCount: (parsedData.usageMetadata.totalTokenCount || 0) - estimatedTokens,
+                   hits: 0
+                 });
+               }
+               
                setCompletedStages(["NORMALIZATION", "CHUNKING", "TOPIC_ANALYSIS", "DUPLICATE_DETECTION", "RELATIONSHIP_ANALYSIS", "BOOK_OUTLINE"]);
                
                const newChapters: Chapter[] = (outlineData.chapters || []).map((c: any) => ({

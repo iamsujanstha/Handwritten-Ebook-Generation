@@ -4,9 +4,11 @@ import { useBookStore } from "../store/useBookStore";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
+import rehypeHighlight from "rehype-highlight";
 import { Download, Layout, Palette, Settings, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 import { BOOK_THEMES, BookTheme } from "../lib/themes";
 import MermaidDiagram from "../components/MermaidDiagram";
+import { safeFetchJson } from "../lib/safeFetch";
 
 export default function Preview() {
   const { id } = useParams<{ id: string }>();
@@ -33,17 +35,11 @@ export default function Preview() {
     setExportError(null);
     
     try {
-      const res = await fetch("/api/export-pdf", {
+      const { exportId } = await safeFetchJson<{ exportId: string }>("/api/export-pdf", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ book, themeId: selectedThemeId })
       });
-      
-      if (!res.ok) {
-        throw new Error("Failed to initialize export job");
-      }
-      
-      const { exportId } = await res.json();
       
       const eventSource = new EventSource(`/api/export-status/${exportId}`);
       
@@ -99,9 +95,21 @@ export default function Preview() {
 
   // Custom Markdown Renderers applying theme classes
   const markdownComponents = {
-    h1: ({node, ...props}: any) => <h1 className={theme.classes.heading1} style={{ pageBreakAfter: 'avoid', breakAfter: 'avoid' }} {...props} />,
-    h2: ({node, ...props}: any) => <h2 className={theme.classes.heading2} style={{ pageBreakAfter: 'avoid', breakAfter: 'avoid' }} {...props} />,
-    h3: ({node, ...props}: any) => <h3 className={theme.classes.heading3} style={{ pageBreakAfter: 'avoid', breakAfter: 'avoid' }} {...props} />,
+    h1: ({node, ...props}: any) => {
+      const text = String(props.children);
+      const isDesc = text.toLowerCase().includes("description");
+      return <h1 className={theme.classes.heading1} style={{ pageBreakAfter: 'avoid', breakAfter: 'avoid', color: isDesc ? "#8b5cf6" : undefined }} {...props} />;
+    },
+    h2: ({node, ...props}: any) => {
+      const text = String(props.children);
+      const isDesc = text.toLowerCase().includes("description");
+      return <h2 className={theme.classes.heading2} style={{ pageBreakAfter: 'avoid', breakAfter: 'avoid', color: isDesc ? "#8b5cf6" : undefined }} {...props} />;
+    },
+    h3: ({node, ...props}: any) => {
+      const text = String(props.children);
+      const isDesc = text.toLowerCase().includes("description");
+      return <h3 className={theme.classes.heading3} style={{ pageBreakAfter: 'avoid', breakAfter: 'avoid', color: isDesc ? "#8b5cf6" : undefined }} {...props} />;
+    },
     p: ({node, ...props}: any) => <p className={theme.classes.paragraph} style={{ orphans: 3, widows: 3 }} {...props} />,
     ul: ({node, ...props}: any) => <ul className={theme.classes.list} {...props} />,
     ol: ({node, ...props}: any) => <ol className={theme.classes.list} style={{ listStyleType: 'decimal' }} {...props} />,
@@ -124,8 +132,8 @@ export default function Preview() {
     td: ({node, ...props}: any) => <td className={theme.classes.td} {...props} />,
     img: ({node, ...props}: any) => (
       <figure className="my-6 p-3 bg-white/90 border border-slate-300 rounded-lg text-center" style={{ breakInside: 'avoid', pageBreakInside: 'avoid' }}>
-        <img style={{ maxWidth: '100%', height: 'auto', margin: '0 auto', display: 'block', borderRadius: '4px' }} {...props} alt={props.alt || "Figure"} />
-        {props.alt && <figcaption className="text-xs text-slate-500 italic mt-2">Figure: {props.alt}</figcaption>}
+        <img style={{ maxWidth: '100%', height: 'auto', margin: '0 auto', display: 'block', borderRadius: '4px' }} {...props} alt={props.alt || "Image"} />
+        {props.alt && <figcaption className="text-xs text-slate-500 italic mt-2">{props.alt}</figcaption>}
       </figure>
     )
   };
@@ -221,7 +229,7 @@ export default function Preview() {
               <h2 className={theme.classes.coverSubtitle}>{book.subtitle}</h2>
               <div className="mt-auto">
                 <p className={theme.classes.coverAuthor}>{book.author}</p>
-                <p className="mt-4 text-sm opacity-50 uppercase tracking-widest font-mono">Published by BookForge AI</p>
+                <p className="mt-4 text-sm opacity-50 uppercase tracking-widest font-mono">Published by Handwritten eBook</p>
               </div>
             </div>
 
@@ -282,7 +290,7 @@ export default function Preview() {
                         <div className={theme.classes.prose}>
                           <ReactMarkdown 
                             remarkPlugins={[remarkGfm]}
-                            rehypePlugins={[rehypeRaw]}
+                            rehypePlugins={[rehypeRaw, rehypeHighlight]}
                             components={markdownComponents as any}
                           >
                             {section.content || "*No content generated yet.*"}
